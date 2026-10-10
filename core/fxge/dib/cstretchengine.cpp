@@ -620,6 +620,52 @@ void CStretchEngine::StretchVert() {
     if (weights.empty()) {
       std::ranges::fill(accum_span, 0u);
     }
+    // A single tap of weight 1.0 is a plain row copy; skip the expensive
+    // multiply loop.
+    if (weights.size() == 1 && weights[0] == kFixedPointOne &&
+        trans_method_ != TransformMethod::kManyBpptoManyBppWithAlpha) {
+      auto dest_row = pdfium::span(dest_scanline_).first(row_bytes);
+      auto src_row = inter_buf_.subspan(
+          static_cast<size_t>(pWeights->src_start_ - src_clip_.top) *
+              inter_pitch_,
+          row_bytes);
+      if (trans_method_ == TransformMethod::k1BppTo8Bpp ||
+          trans_method_ == TransformMethod::k1BppToManyBpp ||
+          trans_method_ == TransformMethod::k8BppTo8Bpp) {
+        auto copy_first_channel = [](auto dest_pixels, auto src_pixels) {
+          for (auto [dest, src] : fxcrt::Zip(dest_pixels, src_pixels)) {
+            dest.blue = src.blue;
+          }
+        };
+        if (DestBpp == 1) {
+          fxcrt::spancpy(dest_row, src_row);
+        } else if (DestBpp == 3) {
+          copy_first_channel(
+              fxcrt::reinterpret_span<FX_BGR_STRUCT<uint8_t>>(dest_row),
+              fxcrt::reinterpret_span<const FX_BGR_STRUCT<uint8_t>>(src_row));
+        } else {
+          CHECK_EQ(DestBpp, 4);
+          copy_first_channel(
+              fxcrt::reinterpret_span<FX_BGRA_STRUCT<uint8_t>>(dest_row),
+              fxcrt::reinterpret_span<const FX_BGRA_STRUCT<uint8_t>>(src_row));
+        }
+      } else if (DestBpp == 3) {
+        fxcrt::spancpy(dest_row, src_row);
+      } else {
+        CHECK_EQ(DestBpp, 4);
+        auto dest_pixels =
+            fxcrt::reinterpret_span<FX_BGRA_STRUCT<uint8_t>>(dest_row);
+        auto src_pixels =
+            fxcrt::reinterpret_span<const FX_BGRA_STRUCT<uint8_t>>(src_row);
+        for (auto [dest, src] : fxcrt::Zip(dest_pixels, src_pixels)) {
+          dest.blue = src.blue;
+          dest.green = src.green;
+          dest.red = src.red;
+        }
+      }
+      dest_bitmap_->ComposeScanline(row - dest_clip_.top, dest_scanline_);
+      continue;
+    }
     for (size_t i = 0; i < weights.size(); ++i) {
       // Hoisted deliberately: `weights` and `accum_span` are both spans of
       // uint32_t, so the compiler cannot prove the accumulation below does
