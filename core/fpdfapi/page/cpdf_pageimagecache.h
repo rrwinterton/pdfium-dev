@@ -79,6 +79,7 @@ class CPDF_PageImageCache {
 
    private:
     void ContinueGetCachedBitmap(CPDF_PageImageCache* pPageImageCache);
+    void RealizeDeferred();
     void CalcSize();
     bool IsCacheValid(const CFX_Size& max_size_required) const;
 
@@ -91,6 +92,8 @@ class CPDF_PageImageCache {
     RetainPtr<CFX_DIBBase> cached_bitmap_;
     RetainPtr<CFX_DIBBase> cached_mask_;
     bool cached_set_max_size_required_ = false;
+    bool realize_bitmap_on_hit_ = false;
+    bool realize_mask_on_hit_ = false;
   };
 
   void ClearImageCacheEntry(const CPDF_Stream* pStream);
