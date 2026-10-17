@@ -109,6 +109,20 @@ RetainPtr<CFX_DIBBase> MakeCachedImage(RetainPtr<CFX_DIBBase> image,
   return realize_hint ? image->Realize() : image;
 }
 
+bool IsSkiaRenderer() {
+#if defined(PDF_USE_SKIA)
+  return CFX_GEModule::IsSkiaRenderer();
+#else
+  return false;
+#endif
+}
+
+// Returns a realized copy of `image`, or `image` itself if realizing fails.
+RetainPtr<CFX_DIBBase> RealizeOrKeep(RetainPtr<CFX_DIBBase> image) {
+  RetainPtr<CFX_DIBBase> realized = image->Realize();
+  return realized ? realized : image;
+}
+
 }  // namespace
 
 CPDF_PageImageCache::CPDF_PageImageCache(CPDF_Page* pPage) : page_(pPage) {}
@@ -187,6 +201,7 @@ bool CPDF_PageImageCache::StartGetCachedBitmap(
   } else {
     cur_image_cache_entry_ = std::make_unique<Entry>(std::move(pImage));
   }
+  const uint32_t old_size = cur_image_cache_entry_->EstimateSize();
   CPDF_DIB::LoadState ret = cur_image_cache_entry_->StartGetCachedBitmap(
       this, pFormResources, pPageResources, bStdCS, eFamily, bLoadMask,
       max_size_required);
@@ -200,6 +215,10 @@ bool CPDF_PageImageCache::StartGetCachedBitmap(
   }
 
   if (ret == CPDF_DIB::LoadState::kFail) {
+    cache_size_ += cur_image_cache_entry_->EstimateSize();
+  } else {
+    // A cache hit can realize the cached image, which changes its size.
+    cache_size_ -= old_size;
     cache_size_ += cur_image_cache_entry_->EstimateSize();
   }
 
@@ -273,6 +292,7 @@ CPDF_DIB::LoadState CPDF_PageImageCache::Entry::StartGetCachedBitmap(
     bool bLoadMask,
     const CFX_Size& max_size_required) {
   if (cached_bitmap_ && IsCacheValid(max_size_required)) {
+    RealizeDeferred();
     cur_bitmap_ = cached_bitmap_;
     cur_mask_ = cached_mask_;
     return CPDF_DIB::LoadState::kSuccess;
@@ -318,18 +338,35 @@ void CPDF_PageImageCache::Entry::ContinueGetCachedBitmap(
   matte_color_ = cur_bitmap_.AsRaw<CPDF_DIB>()->GetMatteColor();
   cur_mask_ = cur_bitmap_.AsRaw<CPDF_DIB>()->DetachMask();
   time_count_ = pPageImageCache->GetTimeCount();
-  if (cur_bitmap_->GetPitch() * cur_bitmap_->GetHeight() < kHugeImageSize) {
-    cached_bitmap_ = MakeCachedImage(cur_bitmap_, /*realize_hint=*/true);
-    cur_bitmap_.Reset();
-  } else {
-    cached_bitmap_ = MakeCachedImage(cur_bitmap_, /*realize_hint=*/false);
-  }
+  // Realizing copies the whole image, which only pays off if the image is
+  // drawn again, so it is deferred to the first cache hit.
+  realize_bitmap_on_hit_ =
+      !IsSkiaRenderer() &&
+      cur_bitmap_->GetPitch() * cur_bitmap_->GetHeight() < kHugeImageSize;
+  realize_mask_on_hit_ = !IsSkiaRenderer() && cur_mask_;
+  cached_bitmap_ = MakeCachedImage(cur_bitmap_, /*realize_hint=*/false);
+  cur_bitmap_.Reset();
   if (cur_mask_) {
-    cached_mask_ = MakeCachedImage(cur_mask_, /*realize_hint=*/true);
+    cached_mask_ = MakeCachedImage(cur_mask_, /*realize_hint=*/false);
     cur_mask_.Reset();
   }
   cur_bitmap_ = cached_bitmap_;
   cur_mask_ = cached_mask_;
+  CalcSize();
+}
+
+void CPDF_PageImageCache::Entry::RealizeDeferred() {
+  if (!realize_bitmap_on_hit_ && !realize_mask_on_hit_) {
+    return;
+  }
+  if (realize_bitmap_on_hit_) {
+    cached_bitmap_ = RealizeOrKeep(std::move(cached_bitmap_));
+    realize_bitmap_on_hit_ = false;
+  }
+  if (realize_mask_on_hit_) {
+    cached_mask_ = RealizeOrKeep(std::move(cached_mask_));
+    realize_mask_on_hit_ = false;
+  }
   CalcSize();
 }
 

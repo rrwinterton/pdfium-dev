@@ -251,4 +251,73 @@ TEST_F(CPDFPageImageCacheTest, NonMcuAlignedDctIsNotReduced) {
   page->AsPDFPage()->ClearView();
 }
 
+TEST_F(CPDFPageImageCacheTest, DeferRealizeToFirstHit) {
+  std::string file_path = PathService::GetTestFilePath("jpeg_reduced_size.pdf");
+  ASSERT_FALSE(file_path.empty());
+  auto document =
+      std::make_unique<CPDF_Document>(std::make_unique<CPDF_DocRenderData>(),
+                                      std::make_unique<CPDF_DocPageData>());
+  ASSERT_EQ(
+      document->LoadDoc(
+          CFX_FileAccessStream::CreateFromFilename(file_path.c_str()), nullptr),
+      CPDF_Parser::SUCCESS);
+
+  RetainPtr<CPDF_Dictionary> page_dict = document->GetMutablePageDictionary(0);
+  ASSERT_TRUE(page_dict);
+  auto page =
+      pdfium::MakeRetain<CPDF_Page>(document.get(), std::move(page_dict));
+  page->AddPageImageCache();
+  page->ParseContent();
+
+  CPDF_PageImageCache* page_image_cache = page->GetPageImageCache();
+  ASSERT_TRUE(page_image_cache);
+
+  CPDF_PageObject* page_obj = page->GetPageObjectByIndex(0);
+  ASSERT_TRUE(page_obj);
+  CPDF_ImageObject* image = page_obj->AsImage();
+  ASSERT_TRUE(image);
+
+  // Initial load: image is cached unrealized.
+  bool should_continue = page_image_cache->StartGetCachedBitmap(
+      image->GetImage(), nullptr, page->GetMutablePageResources(), true,
+      CPDF_ColorSpace::Family::kUnknown, false, {0, 0});
+  while (should_continue) {
+    should_continue = page_image_cache->Continue(nullptr);
+  }
+  RetainPtr<CFX_DIBBase> initial_bitmap = page_image_cache->DetachCurBitmap();
+  ASSERT_TRUE(initial_bitmap);
+
+  // First cache hit: triggers deferred realization.
+  should_continue = page_image_cache->StartGetCachedBitmap(
+      image->GetImage(), nullptr, page->GetMutablePageResources(), true,
+      CPDF_ColorSpace::Family::kUnknown, false, {0, 0});
+  EXPECT_FALSE(should_continue);
+  RetainPtr<CFX_DIBBase> realized_bitmap = page_image_cache->DetachCurBitmap();
+  ASSERT_TRUE(realized_bitmap);
+
+  // Dimensions and formats must match.
+  EXPECT_EQ(initial_bitmap->GetWidth(), realized_bitmap->GetWidth());
+  EXPECT_EQ(initial_bitmap->GetHeight(), realized_bitmap->GetHeight());
+  EXPECT_EQ(initial_bitmap->GetFormat(), realized_bitmap->GetFormat());
+
+#if !defined(PDF_USE_SKIA)
+  // Without Skia, deferred realization replaced the cached unrealized image
+  // with a realized CFX_DIBitmap copy on the first cache hit.
+  EXPECT_NE(initial_bitmap, realized_bitmap);
+#endif
+
+  // Second cache hit: reuses the already realized cached image directly.
+  should_continue = page_image_cache->StartGetCachedBitmap(
+      image->GetImage(), nullptr, page->GetMutablePageResources(), true,
+      CPDF_ColorSpace::Family::kUnknown, false, {0, 0});
+  EXPECT_FALSE(should_continue);
+  RetainPtr<CFX_DIBBase> second_hit_bitmap =
+      page_image_cache->DetachCurBitmap();
+  ASSERT_TRUE(second_hit_bitmap);
+  EXPECT_EQ(realized_bitmap, second_hit_bitmap);
+
+  ASSERT_TRUE(page->AsPDFPage());
+  page->AsPDFPage()->ClearView();
+}
+
 }  // namespace pdfium
