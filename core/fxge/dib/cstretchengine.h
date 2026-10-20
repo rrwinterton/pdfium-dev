@@ -199,6 +199,13 @@ class CStretchEngine {
   pdfium::span<const uint8_t> Expand1BppRow(
       pdfium::span<const uint8_t> src_row);
 
+  int DestRowAt(int index) const;
+  pdfium::span<uint8_t> InterRow(int src_row);
+
+  // Composes, in order, the remaining destination rows whose taps all lie
+  // above `src_rows_ready`.
+  void StretchVertRows(int src_rows_ready);
+
   // What PlanHorzGroups() derives once per stretch for its helpers: the
   // source pixel stride the gather reads, how many leading bytes of each
   // pixel it loads, and the byte length of the row the kernel will read.
@@ -234,16 +241,21 @@ class CStretchEngine {
   const int dest_height_;
   const FX_RECT dest_clip_;
   DataVector<uint8_t> dest_scanline_;
+  // Ring of `inter_rows_` horizontally stretched source rows.
   FixedSizeDataVector<uint8_t> inter_buf_;
   FixedSizeDataVector<uint8_t> expanded_row_;
+  FixedSizeDataVector<uint32_t> accum_;
   FX_RECT src_clip_;
   int inter_pitch_;
   int extra_mask_pitch_;
+  int inter_rows_ = 0;
+  int dest_rows_done_ = 0;
   FXDIB_ResampleOptions resample_options_;
   TransformMethod trans_method_;
   State state_ = State::kInitial;
   int cur_row_ = 0;
   WeightTable weight_table_;
+  WeightTable vert_weight_table_;
   DataVector<StretchHorzGroup> horz_groups_;
   DataVector<StretchHorzRun> horz_runs_;
 };

@@ -15,6 +15,7 @@
 #include "core/fpdfapi/parser/cpdf_number.h"
 #include "core/fpdfapi/parser/cpdf_stream.h"
 #include "core/fxcrt/containers/to_vector.h"
+#include "core/fxcrt/pauseindicator_iface.h"
 #include "core/fxcrt/span.h"
 #include "core/fxcrt/span_util.h"
 #include "core/fxge/dib/cfx_dibitmap.h"
@@ -47,6 +48,8 @@ class ScanlineRecorder final : public ScanlineComposerIface {
     return true;
   }
 
+  const std::map<int, std::vector<uint8_t>>& rows() const { return rows_; }
+
   bool HasRow(int line) const { return rows_.find(line) != rows_.end(); }
 
   bool RowIsAllZero(int line) const {
@@ -58,6 +61,11 @@ class ScanlineRecorder final : public ScanlineComposerIface {
 
  private:
   std::map<int, std::vector<uint8_t>> rows_;
+};
+
+class AlwaysPause final : public PauseIndicatorIface {
+ public:
+  bool NeedToPauseNow() override { return true; }
 };
 
 uint32_t PixelWeightSum(const CStretchEngine::PixelWeight* weights) {
@@ -207,14 +215,13 @@ TEST(CStretchEngine, MirroredDestinationEmptySourceClip) {
 // the tap position up to `src_min` would put it one past the last source
 // pixel, which the horizontal pass then reads.
 //
-// This drives the horizontal pass directly instead of via Continue(), which
-// would go on to run StretchVert() and dereference the null
-// ScanlineComposerIface*. The tap position is consumed by the horizontal
-// pass, so stopping there still covers the case.
+// The tap position is consumed by the horizontal pass, so driving only that
+// pass still covers the case.
 TEST(CStretchEngine, EmptySourceClipAtRightEdge) {
   auto source = pdfium::MakeRetain<CFX_DIBitmap>();
   ASSERT_TRUE(source->Create(100, 50, FXDIB_Format::kBgra));
-  CStretchEngine engine(nullptr, FXDIB_Format::kBgra, /*dest_width=*/100,
+  ScanlineRecorder recorder;
+  CStretchEngine engine(&recorder, FXDIB_Format::kBgra, /*dest_width=*/100,
                         /*dest_height=*/50, FX_RECT(100, 0, 200, 50), source,
                         FXDIB_ResampleOptions());
   ASSERT_TRUE(engine.StartStretchHorz());
@@ -265,6 +272,46 @@ TEST(CStretchEngine, EmptySourceRangeInVerticalPass) {
   for (int line = 25; line < 50; ++line) {
     ASSERT_TRUE(recorder.HasRow(line)) << "line " << line;
     EXPECT_TRUE(recorder.RowIsAllZero(line)) << "line " << line;
+  }
+}
+
+// The vertical pass composes rows while the horizontal pass is still running,
+// so pausing after every batch of source rows must not change the output, for
+// upscaled and downscaled, upright and mirrored destinations.
+TEST(CStretchEngine, PausedStretchMatchesUnpaused) {
+  auto source = pdfium::MakeRetain<CFX_DIBitmap>();
+  ASSERT_TRUE(source->Create(60, 90, FXDIB_Format::kBgr));
+  for (int row = 0; row < source->GetHeight(); ++row) {
+    pdfium::span<uint8_t> scanline = source->GetWritableScanline(row);
+    for (size_t i = 0; i < scanline.size(); ++i) {
+      scanline[i] = static_cast<uint8_t>(row * 7 + i);
+    }
+  }
+
+  for (int height : {37, 200}) {
+    for (int dest_height : {height, -height}) {
+      const FX_RECT clip_rect(0, 0, 45, height);
+      ScanlineRecorder unpaused;
+      CStretchEngine unpaused_engine(&unpaused, FXDIB_Format::kBgr,
+                                     /*dest_width=*/45, dest_height, clip_rect,
+                                     source, FXDIB_ResampleOptions());
+      ASSERT_TRUE(unpaused_engine.StartStretchHorz());
+      EXPECT_FALSE(unpaused_engine.Continue(nullptr));
+
+      ScanlineRecorder paused;
+      CStretchEngine paused_engine(&paused, FXDIB_Format::kBgr,
+                                   /*dest_width=*/45, dest_height, clip_rect,
+                                   source, FXDIB_ResampleOptions());
+      ASSERT_TRUE(paused_engine.StartStretchHorz());
+      AlwaysPause pause;
+      while (paused_engine.Continue(&pause)) {
+      }
+
+      EXPECT_EQ(static_cast<size_t>(height), unpaused.rows().size())
+          << "dest_height " << dest_height;
+      EXPECT_EQ(unpaused.rows(), paused.rows())
+          << "dest_height " << dest_height;
+    }
   }
 }
 
@@ -324,7 +371,10 @@ constexpr std::array<uint8_t, 8> kTestBytes = {0,   1,   84,  127,
 // different phase per (column, tap) so consecutive seeds exercise different
 // combinations -- deliberately, rather than hoping random search eventually
 // covers the same positions and weights.
-StretchHorzGroup BuildTestGroup(int seed, int gathered, uint32_t taps, bool wide) {
+StretchHorzGroup BuildTestGroup(int seed,
+                                int gathered,
+                                uint32_t taps,
+                                bool wide) {
   const int load_bytes = wide ? 32 : 16;
   const int max_pos = load_bytes - gathered;
   const std::array<int, 3> positions = {0, max_pos / 2, max_pos};

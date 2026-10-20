@@ -240,7 +240,8 @@ CStretchEngine::CStretchEngine(ScanlineComposerIface* pDestBitmap,
   if (dest_format == FXDIB_Format::kBgrx) {
     std::ranges::fill(dest_scanline_, 255);
   }
-  inter_pitch_ = fxge::CalculatePitch32OrDie(dest_bpp_, dest_clip_.Width());
+  inter_pitch_ = fxge::CalculatePitch8OrDie(dest_bpp_, /*components=*/1,
+                                            dest_clip_.Width());
   extra_mask_pitch_ = fxge::CalculatePitch32OrDie(8, dest_clip_.Width());
   if (options.bNoSmoothing) {
     resample_options_.bNoSmoothing = true;
@@ -304,18 +305,46 @@ bool CStretchEngine::Continue(PauseIndicatorIface* pPause) {
 }
 
 bool CStretchEngine::StartStretchHorz() {
-  if (dest_width_ == 0 || inter_pitch_ == 0 || dest_scanline_.empty()) {
+  if (dest_width_ == 0 || dest_height_ == 0 || inter_pitch_ == 0 ||
+      dest_scanline_.empty() || src_clip_.Height() <= 0) {
+    return false;
+  }
+  if (!vert_weight_table_.CalculateWeights(
+          dest_height_, dest_clip_.top, dest_clip_.bottom, src_height_,
+          src_clip_.top, src_clip_.bottom, resample_options_)) {
     return false;
   }
 
-  FX_SAFE_SIZE_T safe_size = src_clip_.Height();
+  // Destination rows are composed as soon as their last tap has been stretched
+  // horizontally, so `inter_buf_` only has to hold the taps of the next row to
+  // compose and the rows stretched ahead of them.
+  int src_rows_ready = src_clip_.top;
+  inter_rows_ = 1;
+  for (int i = 0; i < dest_clip_.Height(); ++i) {
+    const PixelWeight* pWeights =
+        vert_weight_table_.GetPixelWeight(DestRowAt(i));
+    if (pWeights->GetWeights().empty()) {
+      continue;
+    }
+    src_rows_ready = std::max(src_rows_ready, pWeights->src_end_ + 1);
+    inter_rows_ = std::max(inter_rows_, src_rows_ready - pWeights->src_start_);
+  }
+  inter_rows_ = std::min(inter_rows_, src_clip_.Height());
+
+  FX_SAFE_SIZE_T safe_size = inter_rows_;
   safe_size *= inter_pitch_;
   const size_t size = safe_size.ValueOrDefault(0);
   if (size == 0) {
     return false;
   }
-  inter_buf_ = FixedSizeDataVector<uint8_t>::TryZeroed(size);
+  // Every byte of a row is written by ContinueStretchHorz() before
+  // StretchVertRows() reads it.
+  inter_buf_ = FixedSizeDataVector<uint8_t>::TryUninit(size);
   if (inter_buf_.empty()) {
+    return false;
+  }
+  accum_ = FixedSizeDataVector<uint32_t>::TryUninit(inter_pitch_);
+  if (accum_.empty()) {
     return false;
   }
   if (!weight_table_.CalculateWeights(
@@ -444,8 +473,7 @@ void CStretchEngine::PlanHorzSpan(int start,
   const size_t original_group_count = horz_groups_.size();
   const size_t original_run_count = horz_runs_.size();
   const std::optional<StretchHorzRun> original_last_run =
-      horz_runs_.empty() ? std::nullopt
-                         : std::make_optional(horz_runs_.back());
+      horz_runs_.empty() ? std::nullopt : std::make_optional(horz_runs_.back());
   int fitting = 0;
   for (int i = 0; i < candidate_groups; ++i) {
     std::optional<StretchHorzGroup> group =
@@ -556,8 +584,7 @@ bool CStretchEngine::ContinueStretchHorz(PauseIndicatorIface* pPause) {
     }
 
     pdfium::span<const uint8_t> src_row_span = source_->GetScanline(cur_row_);
-    pdfium::span<uint8_t> dest_span = inter_buf_.subspan(
-        (cur_row_ - src_clip_.top) * inter_pitch_, inter_pitch_);
+    pdfium::span<uint8_t> dest_span = InterRow(cur_row_);
     size_t dest_span_index = 0;
     // TODO(crbug.com/567627774): reduce duplicated code here
     switch (trans_method_) {
@@ -655,8 +682,7 @@ bool CStretchEngine::ContinueStretchHorz(PauseIndicatorIface* pPause) {
         // compile-time source pixel size.
         auto stretch_row_from = [this, &dest_span](auto src_pixels) {
           // The destination pixels have the same layout as the source
-          // pixels: 3 bytes fully written, or 4 bytes of which the 4th is
-          // left untouched (both here and on the generic path below).
+          // pixels: 3 bytes, or 4 bytes whose unused 4th byte is zeroed.
           using DestPixel =
               std::remove_const_t<typename decltype(src_pixels)::element_type>;
           auto dest_pixels = fxcrt::reinterpret_span<DestPixel>(dest_span);
@@ -715,6 +741,9 @@ bool CStretchEngine::ContinueStretchHorz(PauseIndicatorIface* pPause) {
             dest.blue = PixelFromFixed(dest_b);
             dest.green = PixelFromFixed(dest_g);
             dest.red = PixelFromFixed(dest_r);
+            if constexpr (sizeof(DestPixel) == 4) {
+              dest.alpha = 0;
+            }
             ++col;
           }
         };
@@ -810,52 +839,52 @@ bool CStretchEngine::ContinueStretchHorz(PauseIndicatorIface* pPause) {
         break;
       }
     }
+    StretchVertRows(cur_row_ + 1);
     rows_to_go--;
   }
   return false;
 }
 
 void CStretchEngine::StretchVert() {
-  if (dest_height_ == 0) {
-    return;
-  }
+  StretchVertRows(src_clip_.bottom);
+}
 
-  WeightTable table;
-  if (!table.CalculateWeights(dest_height_, dest_clip_.top, dest_clip_.bottom,
-                              src_height_, src_clip_.top, src_clip_.bottom,
-                              resample_options_)) {
-    return;
-  }
+int CStretchEngine::DestRowAt(int index) const {
+  return dest_height_ < 0 ? dest_clip_.bottom - 1 - index
+                          : dest_clip_.top + index;
+}
 
-  const int dest_cols = dest_clip_.right - dest_clip_.left;
-  if (dest_cols <= 0) {
-    return;
-  }
+pdfium::span<uint8_t> CStretchEngine::InterRow(int src_row) {
+  CHECK_GE(src_row, src_clip_.top);
+  const size_t slot =
+      static_cast<size_t>(src_row - src_clip_.top) % inter_rows_;
+  return inter_buf_.subspan(slot * inter_pitch_, inter_pitch_);
+}
 
+void CStretchEngine::StretchVertRows(int src_rows_ready) {
   const int DestBpp = dest_bpp_ / 8;
-  const size_t row_bytes = Fx2DSizeOrDie(dest_cols, DestBpp);
+  const size_t row_bytes = inter_pitch_;
 
   // Taps are the outer loop, so each one reads a contiguous row of the
   // intermediate buffer into a row-wide accumulator. Per byte the taps are
   // still summed in tap order, so the output is unchanged.
   //
-  // Allocated once outside the row loop rather than constructed inside it:
-  // `row_bytes` uint32s is tens of kilobytes for a wide destination, and one
-  // allocate/free pair per destination row is a large fraction of a scanned
-  // page's render time.
-  //
   // Uninitialised, because the first tap of each row assigns rather than
   // accumulates and so writes every element before anything reads it. The
   // one case with no first tap -- an empty weight range -- zeroes the
   // accumulator explicitly below.
-  auto accum = FixedSizeDataVector<uint32_t>::Uninit(row_bytes);
-  pdfium::span<uint32_t> accum_span = accum.span();
+  pdfium::span<uint32_t> accum_span = accum_.span();
 
-  for (int row = dest_clip_.top; row < dest_clip_.bottom; ++row) {
-    const PixelWeight* pWeights = table.GetPixelWeight(row);
+  for (; dest_rows_done_ < dest_clip_.Height(); ++dest_rows_done_) {
+    const int row = DestRowAt(dest_rows_done_);
+    const PixelWeight* pWeights = vert_weight_table_.GetPixelWeight(row);
     pdfium::span<const uint32_t> weights = pWeights->GetWeights();
     if (!weights.empty()) {
+      if (pWeights->src_end_ >= src_rows_ready) {
+        return;
+      }
       CHECK_GE(pWeights->src_start_, src_clip_.top);
+      CHECK_GE(pWeights->src_start_, src_rows_ready - inter_rows_);
       CHECK_LT(pWeights->src_end_, src_clip_.bottom);
     }
 
@@ -870,10 +899,8 @@ void CStretchEngine::StretchVert() {
       // not alias the weight, and would otherwise reload it every iteration
       // and decline to vectorize.
       const uint32_t pixel_weight = weights[i];
-      auto src_row = inter_buf_.subspan(
-          (static_cast<size_t>(pWeights->src_start_ - src_clip_.top) + i) *
-              inter_pitch_,
-          row_bytes);
+      pdfium::span<const uint8_t> src_row =
+          InterRow(pWeights->src_start_ + static_cast<int>(i));
       // The first tap assigns rather than accumulates. That initialises the
       // whole accumulator, so no separate zeroing pass over the row is
       // needed -- one full-width write instead of a write plus a
